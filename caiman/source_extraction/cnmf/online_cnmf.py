@@ -33,7 +33,7 @@ from scipy.stats import norm
 from sklearn.decomposition import NMF
 from sklearn.preprocessing import normalize
 import tensorflow as tf
-from time import time
+from time import time, sleep
 from typing import List, Tuple
 
 import caiman
@@ -93,9 +93,9 @@ class OnACID(object):
             self.params = params if params is not None else onacid.params
             self.estimates= estimates if estimates is not None else onacid.estimates
         self.dview = dview
-#            if params is None or estimates is None:
-#                raise ValueError("Cannot Specify Estimates and Params While \
-#                                 Loading Object From File")
+        # if params is None or estimates is None:
+        #     raise ValueError("Cannot Specify Estimates and Params While \
+        #         Loading Object From File")
 
     @profile
     def _prepare_object(self, Yr, T, new_dims=None, idx_components=None):
@@ -673,7 +673,7 @@ class OnACID(object):
         self.t_detect.append(time() - t_new)
         t_stat = time()
         if self.params.get('online', 'batch_update_suff_stat'):
-        # faster update using minibatch of frames
+            # faster update using minibatch of frames
             min_batch = min(self.params.get('online', 'update_freq'), mbs)
             if ((t + 1 - self.params.get('online', 'init_batch')) % min_batch == 0):
 
@@ -933,11 +933,14 @@ class OnACID(object):
 
         return self
 
-    def initialize_online(self, model_LN=None):
-        fls = self.params.get('data', 'fnames')
+    def initialize_online(self, model_LN=None, fls=None, init_batch=None):
+        if fls == None:
+            fls = self.params.get('data', 'fnames')
         opts = self.params.get_group('online')
-        Y = caiman.load(fls[0], subindices=slice(0, opts['init_batch'],
-                 None), var_name_hdf5=self.params.get('data', 'var_name_hdf5')).astype(np.float32)
+        if init_batch == None:
+            init_batch = opts['init_batch']
+        Y = caiman.load(fls[0], subindices=slice(0, init_batch,
+                    None), var_name_hdf5=self.params.get('data', 'var_name_hdf5')).astype(np.float32)
         if model_LN is not None:
             Y = Y - caiman.movie(np.squeeze(model_LN.predict(np.expand_dims(Y, -1))))
             Y = np.maximum(Y, 0)
@@ -980,6 +983,7 @@ class OnACID(object):
         self.img_min = img_min
         self.img_norm = img_norm
         if self.params.get('online', 'init_method') == 'bare':
+            logging.info('Using bare init')
             init = self.params.get_group('init').copy()
             is1p = (init['method_init'] == 'corr_pnr' and  init['ring_size_factor'] is not None)
             if is1p:
@@ -1050,15 +1054,18 @@ class OnACID(object):
         dims = Y.shape[1:]
         self.params.set('data', {'dims': dims})
         T1 = np.array(Ts).sum()*self.params.get('online', 'epochs')
+        logging.info('before prepare')
         self._prepare_object(Yr, T1)
+        logging.info('after prepare')
         if opts['show_movie']:
             self.bnd_AC = np.percentile(self.estimates.A.dot(self.estimates.C),
                                         (0.001, 100-0.005))
             #self.bnd_BG = np.percentile(self.estimates.b.dot(self.estimates.f),
             #                            (0.001, 100-0.001))
+        logging.info('end')
         return self
 
-    def save(self,filename):
+    def save(self, filename):
         """save object in hdf5 file format
 
         Args:
@@ -1185,122 +1192,152 @@ class OnACID(object):
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 # break
                 pass
-        t += 1
         return time() - t_frame_start
 
-    def fit_real_time(self, video_dir, init_batch=None, **kargs):
-        self.t_init = -time()
-        fls = glob.glob(os.path.join(video_dir, '*.h5'))
-        print('======================')
-        print(fls)
-        print('======================')
+    def fit_from_dir(self, video_dir, init_batch=None, mode='frame-by-frame', **kargs):
+        # mode: 'frame-to-frame' or 'real-time'
+
         if init_batch == None:
             init_batch = self.params.get('online', 'init_batch')
+        epochs = self.params.get('online', 'epochs')
 
+        # TODO: Need to fix here later
         if self.params.get('online', 'ring_CNN'):
-            logging.info('Using Ring CNN model')
-            from caiman.utils.nn_models import (fit_NL_model, create_LN_model, quantile_loss, rate_scheduler)
-            gSig = self.params.get('init', 'gSig')[0]
-            width = self.params.get('ring_CNN', 'width')
-            nch = self.params.get('ring_CNN', 'n_channels')
-            if self.params.get('ring_CNN', 'loss_fn') == 'pct':
-                loss_fn = quantile_loss(self.params.get('ring_CNN', 'pct'))
-            else:
-                loss_fn = self.params.get('ring_CNN', 'loss_fn')
-            if self.params.get('ring_CNN', 'lr_scheduler') is None:
-                sch = None
-            else:
-                sch = rate_scheduler(*self.params.get('ring_CNN', 'lr_scheduler'))
-            Y = caiman.base.movies.load(fls[0], subindices=slice(init_batch),
-                                        var_name_hdf5=self.params.get('data', 'var_name_hdf5'))
-            shape = Y.shape[1:] + (1,)
-            logging.info('Starting background model training.')
-            model_LN = create_LN_model(Y, shape=shape, n_channels=nch,
-                                       lr=self.params.get('ring_CNN', 'lr'), gSig=gSig,
-                                       loss=loss_fn, width=width,
-                                       use_add=self.params.get('ring_CNN', 'use_add'),
-                                       use_bias=self.params.get('ring_CNN', 'use_bias'))
-            if self.params.get('ring_CNN', 'reuse_model'):
-                logging.info('Using existing model from {}'.format(self.params.get('ring_CNN', 'path_to_model')))
-                model_LN.load_weights(self.params.get('ring_CNN', 'path_to_model'))
-            else:
-                logging.info('Estimating model from scratch, starting training.')
-                model_LN, history, path_to_model = fit_NL_model(model_LN, Y,
-                                                                epochs=self.params.get('ring_CNN', 'max_epochs'),
-                                                                patience=self.params.get('ring_CNN', 'patience'),
-                                                                schedule=sch)
-                logging.info('Training complete. Model saved in {}.'.format(path_to_model))
-                self.params.set('ring_CNN', {'path_to_model': path_to_model})
+            pass
+            # logging.info('Using Ring CNN model')
+            # from caiman.utils.nn_models import (fit_NL_model, create_LN_model, quantile_loss, rate_scheduler)
+            # gSig = self.params.get('init', 'gSig')[0]
+            # width = self.params.get('ring_CNN', 'width')
+            # nch = self.params.get('ring_CNN', 'n_channels')
+            # if self.params.get('ring_CNN', 'loss_fn') == 'pct':
+            #     loss_fn = quantile_loss(self.params.get('ring_CNN', 'pct'))
+            # else:
+            #     loss_fn = self.params.get('ring_CNN', 'loss_fn')
+            # if self.params.get('ring_CNN', 'lr_scheduler') is None:
+            #     sch = None
+            # else:
+            #     sch = rate_scheduler(*self.params.get('ring_CNN', 'lr_scheduler'))
+            # Y = caiman.base.movies.load(fls[0], subindices=slice(init_batch),
+            #                             var_name_hdf5=self.params.get('data', 'var_name_hdf5'))
+            # shape = Y.shape[1:] + (1,)
+            # logging.info('Starting background model training.')
+            # model_LN = create_LN_model(Y, shape=shape, n_channels=nch,
+            #                            lr=self.params.get('ring_CNN', 'lr'), gSig=gSig,
+            #                            loss=loss_fn, width=width,
+            #                            use_add=self.params.get('ring_CNN', 'use_add'),
+            #                            use_bias=self.params.get('ring_CNN', 'use_bias'))
+            # if self.params.get('ring_CNN', 'reuse_model'):
+            #     logging.info('Using existing model from {}'.format(self.params.get('ring_CNN', 'path_to_model')))
+            #     model_LN.load_weights(self.params.get('ring_CNN', 'path_to_model'))
+            # else:
+            #     logging.info('Estimating model from scratch, starting training.')
+            #     model_LN, history, path_to_model = fit_NL_model(model_LN, Y,
+            #                                                     epochs=self.params.get('ring_CNN', 'max_epochs'),
+            #                                                     patience=self.params.get('ring_CNN', 'patience'),
+            #                                                     schedule=sch)
+            #     logging.info('Training complete. Model saved in {}.'.format(path_to_model))
+            #     self.params.set('ring_CNN', {'path_to_model': path_to_model})
         else:
             model_LN = None
-        epochs = self.params.get('online', 'epochs')
-        self.initialize_online(model_LN=model_LN)
-        self.t_init += time()
-        
-        # MEMO: この辺から2つ目以降のファイルを処理してる？
-        extra_files = len(fls) - 1
+
+        # try to read all files        
+        # while len(fls) == 0:
+        #     logging.info('No .h5 files on dir. Read again.')
+        #     sleep(0.1)
+        #     fls = sorted(glob.glob(os.path.join(video_dir, '*.h5')))
+
+        # If fls[0] is avalable, still first file unreadable.
+        finish_init = False
+        while finish_init == False:
+            fls = sorted(glob.glob(os.path.join(video_dir, '*.h5')))
+            if len(fls) == 0:
+                logging.info('No .h5 files on dir. Read again.')
+                sleep(0.1)
+                continue
+
+            try:
+                self.t_init = -time()
+                self.initialize_online(model_LN=model_LN, fls=fls, init_batch=init_batch)
+                finish_init = True
+                self.t_init += time()
+            except OSError as e:
+                logging.info('Init .h5 file cannot read yet.')
+                sleep(0.1)
+
         init_files = 1
         t = init_batch
-        self.Ab_epoch:List = []
         t_online = []
+        where_to_starts = [init_batch]
+        self.Ab_epoch:List = []
         self.comp_upd = []
         self.t_shapes:List = []
         self.t_detect:List = []
         self.t_motion:List = []
         self.t_stat:List = []
-        ssub_B = self.params.get('init', 'ssub_B') * self.params.get('init', 'ssub')
-        d1, d2 = self.params.get('data', 'dims')
-        max_shifts_online = self.params.get('online', 'max_shifts_online')
         
-        # MEMO: extra fileがなければこのファイルのinitで使ってない部分を処理して終了 → online_initには最初の1ファイルだけ渡しときゃOKっぽい
-        if extra_files == 0:     # check whether there are any additional files
-            process_files = fls[:init_files]     # end processing at this file
-            init_batc_iter = [init_batch]         # place where to start
-        else:
-            process_files = fls[:init_files + extra_files]   # additional files
-            # where to start reading at each file
-            init_batc_iter = [init_batch] + [0]*extra_files
         if self.params.get('online', 'save_online_movie') + self.params.get('online', 'show_movie'):
             resize_fact = 2
             fourcc = cv2.VideoWriter_fourcc(*self.params.get('online', 'opencv_codec'))
             out = cv2.VideoWriter(self.params.get('online', 'movie_name_online'),
                                   fourcc, 30, tuple([int(resize_fact*2*x) for x in self.params.get('data', 'dims')]),
                                   True)
-        # Iterate through the epochs
-        for iter in range(epochs):
-            if iter == epochs - 1 and self.params.get('online', 'stop_detection'):
-                self.params.set('online', {'update_num_comps': False})
-            logging.info(f"Searching for new components set to: {self.params.get('online', 'update_num_comps')}")
-            if iter > 0:
-                # if not on first epoch process all files from scratch
-                process_files = fls[:init_files + extra_files]
-                init_batc_iter = [0] * (extra_files + init_files)
 
-            # Go through all files
-            for file_count, ffll in enumerate(process_files):
-                logging.warning('Now processing file {}'.format(ffll))
-                # MEMO: ココで動画ファイルを読む
-                Y_ = caiman.base.movies.load_iter(
-                    ffll, var_name_hdf5=self.params.get('data', 'var_name_hdf5'),
-                    subindices=slice(init_batc_iter[file_count], None, None))
+        logging.warning(f'Init time: {(self.t_init):.3f} sec in {init_batch} frames')
 
-                old_comps = self.N     # number of existing components
-                frame_count = -1
-                
-                # =====================================
-                # main loop
-                # =====================================
-                while True: # process each file
-                    try:
-                        frame_count += 1
-                        frame = next(Y_)
-                        t_online.append(self.fit_next_from_raw(frame, t, model_LN=model_LN))
-                    except  (StopIteration, RuntimeError):
-                        print(f'Error occors in frame {frame_count}')
-                        break
-                # =====================================
-        
-            self.Ab_epoch.append(self.estimates.Ab.copy())
+        # Go through all files
+        file_count = 0
+        finished_files, skipped_files = set(), set()
+        start_time = time()
+
+        while True:
+            fls = glob.glob(os.path.join(video_dir, '*.h5'))
+            fls = sorted(list(set(fls) - finished_files - skipped_files))
+            
+            if len(fls) == 0:
+                logging.warning('There are no more files left! Now waiting for a next frame...')
+                continue
+            else:
+                # 最初の1回だけファイル全体を使う。'real-time'モードではそれ以降最新のファイルだけ使う。
+                if file_count == 0:
+                    file_name = fls[0]
+                    start_frame = init_batch
+                elif mode == 'real-time':
+                    file_name = fls[-1]
+                    start_frame = 0
+                elif mode == 'frame-by-frame':
+                    file_name = fls[0]
+                    start_frame = 0
+                else:
+                    raise ValueError
+
+            old_comps = self.N # number of existing components
+            Y_ = caiman.base.movies.load_iter(
+                file_name,
+                var_name_hdf5=self.params.get('data', 'var_name_hdf5'),
+                subindices=slice(start_frame, None, None))
+
+            # =====================================
+            # main fit loop in each .h5 file
+            # =====================================
+            while True: # process each file
+                logging.warning('Now processing file {}'.format(file_name))
+                try:
+                    frame = next(Y_)
+                    t_online.append(self.fit_next_from_raw(frame, t, model_LN=model_LN))
+                    t += 1
+                except OSError as e:
+                    logging.info('This .h5 file cannot read yet.')
+                    break
+                except (StopIteration, RuntimeError):
+                    logging.info('This .h5 file analysis is finished.')
+                    if mode == 'real-time':
+                        skipped_files |= set(fls[:-2])
+                    finished_files.add(file_name)
+                    logging.info(self.estimates.C_on[self.params.get('init', 'nb'):self.M, t - t // epochs:t].shape)
+                    break
+            # =====================================
+            
+            logging.warning(f'Average processing time: {(time() - start_time) / (t):.3f} sec')
 
         if self.params.get('online', 'normalize'):
             self.estimates.Ab = csc_matrix(self.estimates.Ab.multiply(
@@ -1465,6 +1502,7 @@ class OnACID(object):
                         frame = next(Y_)
                         frame_count += 1
                         t_online.append(self.fit_next_from_raw(frame, t, model_LN=model_LN))
+                        t += 1
                     except  (StopIteration, RuntimeError):
                         print(f'Error occors in frame {frame_count}')
                         break
