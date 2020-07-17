@@ -19,6 +19,7 @@ from builtins import range
 from builtins import str
 from builtins import zip
 import cv2
+import glob
 import logging
 from math import sqrt
 from multiprocessing import current_process, cpu_count
@@ -168,6 +169,8 @@ class OnACID(object):
 
         self.estimates.noisyC[self.params.get('init', 'nb'):self.M, :self.params.get('online', 'init_batch')] = self.estimates.C + self.estimates.YrA
         self.estimates.noisyC[:self.params.get('init', 'nb'), :self.params.get('online', 'init_batch')] = self.estimates.f
+        
+        # MEMO: estimates.C_onを定義している。C_onはinit_batchまでの長さしか持たないのでココがinitializationかな？
         if self.params.get('preprocess', 'p'):
             # if no parameter for calculating the spike size threshold is given, then use L1 penalty
             if self.params.get('temporal', 's_min') is None:
@@ -189,9 +192,10 @@ class OnACID(object):
         else:
             self.estimates.C_on[:self.N, :init_batch] = self.estimates.C
         
+        # MEMO: 1pの時の処理系
         if self.is1p:
             ssub_B = self.params.get('init', 'ssub_B') * self.params.get('init', 'ssub')
-            X = Yr[:, :init_batch] - np.asarray(self.estimates.A.dot(self.estimates.C))
+            X = Yr[:, :init_batch] - np.asarray(self.estimates.A.dot(self.estimates.C))  # initについてのb0を計算してる。Yrは元動画？
             self.estimates.b0 = X.mean(1)
             X -= self.estimates.b0[:, None]
             if ssub_B > 1:
@@ -230,6 +234,7 @@ class OnACID(object):
         self.estimates.C_on = np.vstack(
             [self.estimates.noisyC[:self.params.get('init', 'nb'), :], self.estimates.C_on.astype(np.float32)])
 
+        # MEMO: 2pのときなので関係なし
         if not self.is1p:
             self.params.set('init', {'gSiz': np.add(np.multiply(np.ceil(
                 self.params.get('init', 'gSig')).astype(np.int), 2), 1)})
@@ -240,6 +245,7 @@ class OnACID(object):
             self.estimates.C_on[:self.M, self.params.get('online', 'init_batch') - self.params.get('online', 'minibatch_shape'):
             self.params.get('online', 'init_batch')]).T, self.params.get('online', 'minibatch_shape'))
 
+        # MEMO: 1p
         if self.is1p:
             estim = self.estimates
             d1, d2 = estim.dims    
@@ -408,7 +414,7 @@ class OnACID(object):
         d1, d2 = self.estimates.dims
         expected_comps = self.params.get('online', 'expected_comps')
         frame = frame_in.astype(np.float32)
-#        print(np.max(1/scipy.sparse.linalg.norm(self.estimates.Ab,axis = 0)))
+        # print(np.max(1/scipy.sparse.linalg.norm(self.estimates.Ab,axis = 0)))
         self.estimates.Yr_buf.append(frame)
         if len(self.estimates.ind_new) > 0:
             self.estimates.mean_buff = self.estimates.Yres_buf.mean(0)
@@ -819,10 +825,10 @@ class OnACID(object):
                     else:
                         XXt_mats = self.XXt_mats
                         XXt_vecs = self.XXt_vecs
-#                        def process_pixel2(p):
-#                            #return np.linalg.solve(a[0], a[1])
-#                            return np.linalg.solve(XXt_mats[p], XXt_vecs[p])
-                       # W.data = np.concatenate(list(map(process_pixel2, range(W.shape[0]))))
+                        # def process_pixel2(p):
+                            # # return np.linalg.solve(a[0], a[1])
+                            # return np.linalg.solve(XXt_mats[p], XXt_vecs[p])
+                        # W.data = np.concatenate(list(map(process_pixel2, range(W.shape[0]))))
                         if self.dview is None: 
                             W.data = np.concatenate(list(map(inv_mat_vec, zip(XXt_mats, XXt_vecs))))
                         elif 'multiprocessing' in str(type(self.dview)):
@@ -831,8 +837,8 @@ class OnACID(object):
                             W.data = np.concatenate(list(self.dview.map_sync(inv_mat_vec, zip(XXt_mats, XXt_vecs))))
                             self.dview.results.clear()
                            
-                       #W.data = np.concatenate(parmap(process_pixel2, range(W.shape[0])))
-                       #W.data = np.concatenate(parmap(process_pixel2, zip(XXt_mats, XXt_vecs)))
+                        # W.data = np.concatenate(parmap(process_pixel2, range(W.shape[0])))
+                        # W.data = np.concatenate(parmap(process_pixel2, zip(XXt_mats, XXt_vecs)))
                     
                     if ssub_B == 1:
                         self.estimates.Atb = Ab_.T.dot(W.dot(self.estimates.b0) - self.estimates.b0)
@@ -1066,6 +1072,275 @@ class OnACID(object):
         else:
             raise Exception("Unsupported file extension")
 
+    def fit_next_from_raw(self, frame, t, model_LN=None, out=None):
+        """
+        Args:
+            frame: numpy.ndarray
+                frame in raw video file
+
+            t: int
+                time?
+
+            model_LN: ?
+                なんか
+            out: ?
+                need if show_video=True
+        Returns:
+            frame_time: float
+                time used in this method
+        """
+        ssub_B = self.params.get('init', 'ssub_B') * self.params.get('init', 'ssub')
+        d1, d2 = self.params.get('data', 'dims')
+        max_shifts_online = self.params.get('online', 'max_shifts_online')
+
+        if model_LN is not None:
+            if self.params.get('ring_CNN', 'remove_activity'):
+                activity = self.estimates.Ab[:,:self.N].dot(self.estimates.C_on[:self.N, t-1]).reshape(self.params.get('data', 'dims'), order='F')
+                if self.params.get('online', 'normalize'):
+                    activity *= self.img_norm
+            else:
+                activity = 0.
+                # frame = frame.astype(np.float32) - activity
+            frame = frame - np.squeeze(model_LN.predict(np.expand_dims(np.expand_dims(frame.astype(np.float32) - activity, 0), -1)))
+            frame = np.maximum(frame, 0)
+
+        t_frame_start = time()
+        if np.isnan(np.sum(frame)):
+            raise Exception('Current frame contains NaN')
+        if t % 500 == 0:
+            logging.info('Epoch: ' + str(iter + 1) + '. ' + str(t) +
+                            ' frames have beeen processed in total. ' +
+                            str(self.N - old_comps) +
+                            ' new components were added. Total # of components is '
+                            + str(self.estimates.Ab.shape[-1] - self.params.get('init', 'nb')))
+            old_comps = self.N
+
+        # Downsample and normalize
+        frame_ = frame.copy().astype(np.float32)
+        if self.params.get('online', 'ds_factor') > 1:
+            frame_ = cv2.resize(frame_, self.img_norm.shape[::-1])
+
+        if self.params.get('online', 'normalize'):
+            frame_ -= self.img_min     # make data non-negative
+        t_mot = time()
+
+        # Motion Correction
+        if self.params.get('online', 'motion_correct'):    # motion correct
+            templ = self.estimates.Ab.dot(
+                    np.median(self.estimates.C_on[:self.M, t-51:t-1], 1)).reshape(self.params.get('data', 'dims'), order='F')#*self.img_norm
+            if self.is1p and self.estimates.W is not None:
+                if ssub_B == 1:
+                    B = self.estimates.W.dot((frame_ - templ).flatten(order='F') - self.estimates.b0) + self.estimates.b0
+                    B = B.reshape(self.params.get('data', 'dims'), order='F')
+                else:
+                    b0 = self.estimates.b0.reshape((d1, d2), order='F')#*self.img_norm
+                    bc2 = downscale(frame_ - templ - b0, (ssub_B, ssub_B)).flatten(order='F')
+                    Wb = self.estimates.W.dot(bc2).reshape(((d1 - 1) // ssub_B + 1, (d2 - 1) // ssub_B + 1), order='F')
+                    B = b0 + np.repeat(np.repeat(Wb, ssub_B, 0), ssub_B, 1)[:d1, :d2]
+                templ += B
+            if self.params.get('online', 'normalize'):
+                templ *= self.img_norm
+            if self.is1p:
+                templ = high_pass_filter_space(templ, self.params.motion['gSig_filt'])
+            if self.params.get('motion', 'pw_rigid'):
+                frame_cor, shift, _, xy_grid = tile_and_correct(frame_, templ, self.params.motion['strides'], self.params.motion['overlaps'],
+                                                                self.params.motion['max_shifts'], newoverlaps=None, newstrides=None, upsample_factor_grid=4,
+                                                                upsample_factor_fft=10, show_movie=False, max_deviation_rigid=self.params.motion['max_deviation_rigid'],
+                                                                add_to_movie=0, shifts_opencv=True, gSig_filt=None,
+                                                                use_cuda=False, border_nan='copy')
+            else:
+                if self.is1p:
+                    frame_orig = frame_.copy()
+                    frame_ = high_pass_filter_space(frame_, self.params.motion['gSig_filt'])
+                frame_cor, shift = motion_correct_iteration_fast(
+                        frame_, templ, max_shifts_online, max_shifts_online)
+                if self.is1p:
+                    M = np.float32([[1, 0, shift[1]], [0, 1, shift[0]]])
+                    frame_cor = cv2.warpAffine(
+                        frame_orig, M, frame_.shape[::-1], flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
+
+            self.estimates.shifts.append(shift)
+        else:
+            templ = None
+            frame_cor = frame_
+
+        self.t_motion.append(time() - t_mot)
+        
+        if self.params.get('online', 'normalize'):
+            frame_cor = frame_cor/self.img_norm
+        # Fit next frame
+        self.fit_next(t, frame_cor.reshape(-1, order='F')) # MEMO: ここでfit_nextが呼ばれてる→その前に色々ある
+        # Show
+        if self.params.get('online', 'show_movie'):
+            self.t = t
+            vid_frame = self.create_frame(frame_cor, resize_fact=resize_fact)
+            if self.params.get('online', 'save_online_movie'):
+                out.write(vid_frame)
+                for rp in range(len(self.estimates.ind_new)*2):
+                    out.write(vid_frame)
+
+            cv2.imshow('frame', vid_frame)
+            for rp in range(len(self.estimates.ind_new)*2):
+                cv2.imshow('frame', vid_frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                # break
+                pass
+        t += 1
+        return time() - t_frame_start
+
+    def fit_real_time(self, video_dir, init_batch=None, **kargs):
+        self.t_init = -time()
+        fls = glob.glob(os.path.join(video_dir, '*.h5'))
+        print('======================')
+        print(fls)
+        print('======================')
+        if init_batch == None:
+            init_batch = self.params.get('online', 'init_batch')
+
+        if self.params.get('online', 'ring_CNN'):
+            logging.info('Using Ring CNN model')
+            from caiman.utils.nn_models import (fit_NL_model, create_LN_model, quantile_loss, rate_scheduler)
+            gSig = self.params.get('init', 'gSig')[0]
+            width = self.params.get('ring_CNN', 'width')
+            nch = self.params.get('ring_CNN', 'n_channels')
+            if self.params.get('ring_CNN', 'loss_fn') == 'pct':
+                loss_fn = quantile_loss(self.params.get('ring_CNN', 'pct'))
+            else:
+                loss_fn = self.params.get('ring_CNN', 'loss_fn')
+            if self.params.get('ring_CNN', 'lr_scheduler') is None:
+                sch = None
+            else:
+                sch = rate_scheduler(*self.params.get('ring_CNN', 'lr_scheduler'))
+            Y = caiman.base.movies.load(fls[0], subindices=slice(init_batch),
+                                        var_name_hdf5=self.params.get('data', 'var_name_hdf5'))
+            shape = Y.shape[1:] + (1,)
+            logging.info('Starting background model training.')
+            model_LN = create_LN_model(Y, shape=shape, n_channels=nch,
+                                       lr=self.params.get('ring_CNN', 'lr'), gSig=gSig,
+                                       loss=loss_fn, width=width,
+                                       use_add=self.params.get('ring_CNN', 'use_add'),
+                                       use_bias=self.params.get('ring_CNN', 'use_bias'))
+            if self.params.get('ring_CNN', 'reuse_model'):
+                logging.info('Using existing model from {}'.format(self.params.get('ring_CNN', 'path_to_model')))
+                model_LN.load_weights(self.params.get('ring_CNN', 'path_to_model'))
+            else:
+                logging.info('Estimating model from scratch, starting training.')
+                model_LN, history, path_to_model = fit_NL_model(model_LN, Y,
+                                                                epochs=self.params.get('ring_CNN', 'max_epochs'),
+                                                                patience=self.params.get('ring_CNN', 'patience'),
+                                                                schedule=sch)
+                logging.info('Training complete. Model saved in {}.'.format(path_to_model))
+                self.params.set('ring_CNN', {'path_to_model': path_to_model})
+        else:
+            model_LN = None
+        epochs = self.params.get('online', 'epochs')
+        self.initialize_online(model_LN=model_LN)
+        self.t_init += time()
+        
+        # MEMO: この辺から2つ目以降のファイルを処理してる？
+        extra_files = len(fls) - 1
+        init_files = 1
+        t = init_batch
+        self.Ab_epoch:List = []
+        t_online = []
+        self.comp_upd = []
+        self.t_shapes:List = []
+        self.t_detect:List = []
+        self.t_motion:List = []
+        self.t_stat:List = []
+        ssub_B = self.params.get('init', 'ssub_B') * self.params.get('init', 'ssub')
+        d1, d2 = self.params.get('data', 'dims')
+        max_shifts_online = self.params.get('online', 'max_shifts_online')
+        
+        # MEMO: extra fileがなければこのファイルのinitで使ってない部分を処理して終了 → online_initには最初の1ファイルだけ渡しときゃOKっぽい
+        if extra_files == 0:     # check whether there are any additional files
+            process_files = fls[:init_files]     # end processing at this file
+            init_batc_iter = [init_batch]         # place where to start
+        else:
+            process_files = fls[:init_files + extra_files]   # additional files
+            # where to start reading at each file
+            init_batc_iter = [init_batch] + [0]*extra_files
+        if self.params.get('online', 'save_online_movie') + self.params.get('online', 'show_movie'):
+            resize_fact = 2
+            fourcc = cv2.VideoWriter_fourcc(*self.params.get('online', 'opencv_codec'))
+            out = cv2.VideoWriter(self.params.get('online', 'movie_name_online'),
+                                  fourcc, 30, tuple([int(resize_fact*2*x) for x in self.params.get('data', 'dims')]),
+                                  True)
+        # Iterate through the epochs
+        for iter in range(epochs):
+            if iter == epochs - 1 and self.params.get('online', 'stop_detection'):
+                self.params.set('online', {'update_num_comps': False})
+            logging.info(f"Searching for new components set to: {self.params.get('online', 'update_num_comps')}")
+            if iter > 0:
+                # if not on first epoch process all files from scratch
+                process_files = fls[:init_files + extra_files]
+                init_batc_iter = [0] * (extra_files + init_files)
+
+            # Go through all files
+            for file_count, ffll in enumerate(process_files):
+                logging.warning('Now processing file {}'.format(ffll))
+                # MEMO: ココで動画ファイルを読む
+                Y_ = caiman.base.movies.load_iter(
+                    ffll, var_name_hdf5=self.params.get('data', 'var_name_hdf5'),
+                    subindices=slice(init_batc_iter[file_count], None, None))
+
+                old_comps = self.N     # number of existing components
+                frame_count = -1
+                
+                # =====================================
+                # main loop
+                # =====================================
+                while True: # process each file
+                    try:
+                        frame_count += 1
+                        frame = next(Y_)
+                        t_online.append(self.fit_next_from_raw(frame, t, model_LN=model_LN))
+                    except  (StopIteration, RuntimeError):
+                        print(f'Error occors in frame {frame_count}')
+                        break
+                # =====================================
+        
+            self.Ab_epoch.append(self.estimates.Ab.copy())
+
+        if self.params.get('online', 'normalize'):
+            self.estimates.Ab = csc_matrix(self.estimates.Ab.multiply(
+                self.img_norm.reshape(-1, order='F')[:, np.newaxis]))
+        self.estimates.A, self.estimates.b = self.estimates.Ab[:, self.params.get('init', 'nb'):], self.estimates.Ab[:, :self.params.get('init', 'nb')].toarray()
+        self.estimates.C, self.estimates.f = self.estimates.C_on[self.params.get('init', 'nb'):self.M, t - t //
+                         epochs:t], self.estimates.C_on[:self.params.get('init', 'nb'), t - t // epochs:t]
+        noisyC = self.estimates.noisyC[self.params.get('init', 'nb'):self.M, t - t // epochs:t]
+        self.estimates.YrA = noisyC - self.estimates.C
+        if self.estimates.OASISinstances is not None:
+            self.estimates.bl = [osi.b for osi in self.estimates.OASISinstances]
+            self.estimates.S = np.stack([osi.s for osi in self.estimates.OASISinstances])
+            self.estimates.S = self.estimates.S[:, t - t // epochs:t]
+        else:
+            self.estimates.bl = [0] * self.estimates.C.shape[0]
+            self.estimates.S = np.zeros_like(self.estimates.C)
+        if self.params.get('online', 'ds_factor') > 1:
+            dims = frame.shape
+            self.estimates.A = hstack([coo_matrix(cv2.resize(self.estimates.A[:, i].reshape(self.estimates.dims, order='F').toarray(),
+                                                            dims[::-1]).reshape(-1, order='F')[:,None]) for i in range(self.N)], format='csc')
+            if self.estimates.b.shape[-1] > 0:
+                self.estimates.b = np.concatenate([cv2.resize(self.estimates.b[:, i].reshape(self.estimates.dims, order='F'),
+                                                              dims[::-1]).reshape(-1, order='F')[:,None] for i in range(self.params.get('init', 'nb'))], axis=1)
+            else:
+                self.estimates.b = np.resize(self.estimates.b, (self.estimates.A.shape[0], 0))
+            if self.estimates.b0 is not None:
+                b0 = self.estimates.b0.reshape(self.estimates.dims, order='F')
+                b0 = cv2.resize(b0, dims[::-1])
+                self.estimates.b0 = b0.reshape((-1, 1), order='F')
+            self.params.set('data', {'dims': dims})
+            self.estimates.dims = dims
+        if self.params.get('online', 'save_online_movie'):
+            out.release()
+        if self.params.get('online', 'show_movie'):
+            cv2.destroyAllWindows()
+        self.t_online = t_online
+        self.estimates.C_on = self.estimates.C_on[:self.M]
+        self.estimates.noisyC = self.estimates.noisyC[:self.M]
+
+        return self
 
     def fit_online(self, **kwargs):
         """Implements the caiman online algorithm on the list of files fls. The
@@ -1181,105 +1456,19 @@ class OnACID(object):
 
                 old_comps = self.N     # number of existing components
                 frame_count = -1
-                while True:   # process each file
+                
+                # =====================================
+                # main loop
+                # =====================================
+                while True: # process each file
                     try:
                         frame = next(Y_)
-                        if model_LN is not None:
-                            if self.params.get('ring_CNN', 'remove_activity'):
-                                activity = self.estimates.Ab[:,:self.N].dot(self.estimates.C_on[:self.N, t-1]).reshape(self.params.get('data', 'dims'), order='F')
-                                if self.params.get('online', 'normalize'):
-                                    activity *= self.img_norm
-                            else:
-                                activity = 0.
-#                                frame = frame.astype(np.float32) - activity
-                            frame = frame - np.squeeze(model_LN.predict(np.expand_dims(np.expand_dims(frame.astype(np.float32) - activity, 0), -1)))
-                            frame = np.maximum(frame, 0)
                         frame_count += 1
-                        t_frame_start = time()
-                        if np.isnan(np.sum(frame)):
-                            raise Exception('Frame ' + str(frame_count) +
-                                            ' contains NaN')
-                        if t % 500 == 0:
-                            logging.info('Epoch: ' + str(iter + 1) + '. ' + str(t) +
-                                         ' frames have beeen processed in total. ' +
-                                         str(self.N - old_comps) +
-                                         ' new components were added. Total # of components is '
-                                         + str(self.estimates.Ab.shape[-1] - self.params.get('init', 'nb')))
-                            old_comps = self.N
-
-                        # Downsample and normalize
-                        frame_ = frame.copy().astype(np.float32)
-                        if self.params.get('online', 'ds_factor') > 1:
-                            frame_ = cv2.resize(frame_, self.img_norm.shape[::-1])
-
-                        if self.params.get('online', 'normalize'):
-                            frame_ -= self.img_min     # make data non-negative
-                        t_mot = time()
-
-                        # Motion Correction
-                        if self.params.get('online', 'motion_correct'):    # motion correct
-                            templ = self.estimates.Ab.dot(
-                                    np.median(self.estimates.C_on[:self.M, t-51:t-1], 1)).reshape(self.params.get('data', 'dims'), order='F')#*self.img_norm
-                            if self.is1p and self.estimates.W is not None:
-                                if ssub_B == 1:
-                                    B = self.estimates.W.dot((frame_ - templ).flatten(order='F') - self.estimates.b0) + self.estimates.b0
-                                    B = B.reshape(self.params.get('data', 'dims'), order='F')
-                                else:
-                                    b0 = self.estimates.b0.reshape((d1, d2), order='F')#*self.img_norm
-                                    bc2 = downscale(frame_ - templ - b0, (ssub_B, ssub_B)).flatten(order='F')
-                                    Wb = self.estimates.W.dot(bc2).reshape(((d1 - 1) // ssub_B + 1, (d2 - 1) // ssub_B + 1), order='F')
-                                    B = b0 + np.repeat(np.repeat(Wb, ssub_B, 0), ssub_B, 1)[:d1, :d2]
-                                templ += B
-                            if self.params.get('online', 'normalize'):
-                                templ *= self.img_norm
-                            if self.is1p:
-                                templ = high_pass_filter_space(templ, self.params.motion['gSig_filt'])
-                            if self.params.get('motion', 'pw_rigid'):
-                                frame_cor, shift, _, xy_grid = tile_and_correct(frame_, templ, self.params.motion['strides'], self.params.motion['overlaps'],
-                                                                                self.params.motion['max_shifts'], newoverlaps=None, newstrides=None, upsample_factor_grid=4,
-                                                                                upsample_factor_fft=10, show_movie=False, max_deviation_rigid=self.params.motion['max_deviation_rigid'],
-                                                                                add_to_movie=0, shifts_opencv=True, gSig_filt=None,
-                                                                                use_cuda=False, border_nan='copy')
-                            else:
-                                if self.is1p:
-                                    frame_orig = frame_.copy()
-                                    frame_ = high_pass_filter_space(frame_, self.params.motion['gSig_filt'])
-                                frame_cor, shift = motion_correct_iteration_fast(
-                                        frame_, templ, max_shifts_online, max_shifts_online)
-                                if self.is1p:
-                                    M = np.float32([[1, 0, shift[1]], [0, 1, shift[0]]])
-                                    frame_cor = cv2.warpAffine(
-                                        frame_orig, M, frame_.shape[::-1], flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REFLECT)
-
-                            self.estimates.shifts.append(shift)
-                        else:
-                            templ = None
-                            frame_cor = frame_
-
-                        self.t_motion.append(time() - t_mot)
-                        
-                        if self.params.get('online', 'normalize'):
-                            frame_cor = frame_cor/self.img_norm
-                        # Fit next frame
-                        self.fit_next(t, frame_cor.reshape(-1, order='F'))
-                        # Show
-                        if self.params.get('online', 'show_movie'):
-                            self.t = t
-                            vid_frame = self.create_frame(frame_cor, resize_fact=resize_fact)
-                            if self.params.get('online', 'save_online_movie'):
-                                out.write(vid_frame)
-                                for rp in range(len(self.estimates.ind_new)*2):
-                                    out.write(vid_frame)
-
-                            cv2.imshow('frame', vid_frame)
-                            for rp in range(len(self.estimates.ind_new)*2):
-                                cv2.imshow('frame', vid_frame)
-                            if cv2.waitKey(1) & 0xFF == ord('q'):
-                                break
-                        t += 1
-                        t_online.append(time() - t_frame_start)
+                        t_online.append(self.fit_next_from_raw(frame, t, model_LN=model_LN))
                     except  (StopIteration, RuntimeError):
+                        print(f'Error occors in frame {frame_count}')
                         break
+                # =====================================
         
             self.Ab_epoch.append(self.estimates.Ab.copy())
 
@@ -1532,7 +1721,7 @@ def seeded_initialization(Y, Ain, dims=None, init_batch=1000, order_init=None, g
     f_in = model.components_.squeeze()
     f_in = np.atleast_2d(f_in)
     Y_resf = np.dot(Yr, f_in.T)
-#    b_in = np.maximum(Y_resf.dot(np.linalg.inv(f_in.dot(f_in.T))), 0)
+    # b_in = np.maximum(Y_resf.dot(np.linalg.inv(f_in.dot(f_in.T))), 0)
     b_in = np.maximum(np.linalg.solve(f_in.dot(f_in.T), Y_resf.T), 0).T
     # b_in = np.maximum(pd_solve(f_in.dot(f_in.T), Y_resf.T), 0).T
     Yr_no_bg = (Yr - b_in.dot(f_in)).astype(np.float32)
@@ -2061,27 +2250,27 @@ def get_candidate_components(sv, dims, Yres_buf, min_num_trial=3, gSig=(5, 5),
     if use_peak_max:
 
         img_select_peaks = sv.reshape(dims).copy()
-#        plt.subplot(1,3,1)
-#        plt.cla()
-#        plt.imshow(img_select_peaks)
+        # plt.subplot(1,3,1)
+        # plt.cla()
+        # plt.imshow(img_select_peaks)
 
         img_select_peaks = cv2.GaussianBlur(img_select_peaks , ksize=ksize, sigmaX=gSig[0],
                                                         sigmaY=gSig[1], borderType=cv2.BORDER_REPLICATE) \
                     - cv2.boxFilter(img_select_peaks, ddepth=-1, ksize=ksize, borderType=cv2.BORDER_REPLICATE)
         thresh_img_sel = 0 #np.median(img_select_peaks) + thresh_std_peak_resid  * np.std(img_select_peaks)
 
-#        plt.subplot(1,3,2)
-#        plt.cla()
-#        plt.imshow(img_select_peaks*(img_select_peaks>thresh_img_sel))
-#        plt.pause(.05)
-#        threshold_abs = np.median(img_select_peaks) + np.std(img_select_peaks)
-
-#        img_select_peaks -= np.min(img_select_peaks)
-#        img_select_peaks /= np.max(img_select_peaks)
-#        img_select_peaks *= 2**15
-#        img_select_peaks = img_select_peaks.astype(np.uint16)
-#        clahe = cv2.createCLAHE(clipLimit=40.0, tileGridSize=(half_crop_cnn[0]//2,half_crop_cnn[0]//2))
-#        img_select_peaks = clahe.apply(img_select_peaks)
+        # plt.subplot(1,3,2)
+        # plt.cla()
+        # plt.imshow(img_select_peaks*(img_select_peaks>thresh_img_sel))
+        # plt.pause(.05)
+        # threshold_abs = np.median(img_select_peaks) + np.std(img_select_peaks)
+        
+        # img_select_peaks -= np.min(img_select_peaks)
+        # img_select_peaks /= np.max(img_select_peaks)
+        # img_select_peaks *= 2**15
+        # img_select_peaks = img_select_peaks.astype(np.uint16)
+        # clahe = cv2.createCLAHE(clipLimit=40.0, tileGridSize=(half_crop_cnn[0]//2,half_crop_cnn[0]//2))
+        # img_select_peaks = clahe.apply(img_select_peaks)
 
         local_maxima = peak_local_max(img_select_peaks,
                                       min_distance=np.max(np.array(gSig)).astype(np.int),
@@ -2257,7 +2446,7 @@ def update_num_components(t, sv, Ab, Cf, Yres_buf, Y_buf, rho_buf,
                 ain).T > thresh_overlap)[0] + gnb
 
         if ff.size > 0:
-#                accepted = False
+            # accepted = False
             cc = [corr(cin_circ.copy(), cins) for cins in Cf[ff, :]]
             if np.any(np.array(cc) > .25) and accepted:
                 accepted = False         # reject component as duplicate
@@ -2495,10 +2684,10 @@ def initialize_movie_online(Y, K, gSig, rf, stride, base_name,
     images = np.reshape(Yr.T, [T] + list(dims), order='F')
     Y = np.reshape(Yr, dims + (T,), order='F')
     Cn2 = caiman.local_correlations(Y)
-#    pl.imshow(Cn2)
+    # pl.imshow(Cn2)
     #%
     #% RUN ALGORITHM ON PATCHES
-#    pl.close('all')
+    # pl.close('all')
     cnm_init = caiman.source_extraction.cnmf.CNMF(n_processes, method_init='greedy_roi', k=K, gSig=gSig, merge_thresh=merge_thresh,
                                               p=0, dview=dview, Ain=None, rf=rf, stride=stride, method_deconvolution='oasis', skip_refinement=False,
                                               normalize_init=False, options_local_NMF=None,
@@ -2580,8 +2769,8 @@ def initialize_movie_online(Y, K, gSig, rf, stride, base_name,
 
     #%
 
-#    cnm_init.dview = None
-#    save_object(cnm_init,fls[0][:-4]+ '_DS_' + str(ds)+ '_init.pkl')
+    # cnm_init.dview = None
+    # save_object(cnm_init,fls[0][:-4]+ '_DS_' + str(ds)+ '_init.pkl')
 
     return cnm_refine, Cn2, fname_new
 
