@@ -1114,13 +1114,6 @@ class OnACID(object):
         t_frame_start = time()
         if np.isnan(np.sum(frame)):
             raise Exception('Current frame contains NaN')
-        if t % 500 == 0:
-            logging.info('Epoch: ' + str(iter + 1) + '. ' + str(t) +
-                            ' frames have beeen processed in total. ' +
-                            str(self.N - old_comps) +
-                            ' new components were added. Total # of components is '
-                            + str(self.estimates.Ab.shape[-1] - self.params.get('init', 'nb')))
-            old_comps = self.N
 
         # Downsample and normalize
         frame_ = frame.copy().astype(np.float32)
@@ -1502,6 +1495,13 @@ class OnACID(object):
                         frame = next(Y_)
                         frame_count += 1
                         t_online.append(self.fit_next_from_raw(frame, t, model_LN=model_LN))
+                        if t % 500 == 0:
+                            logging.info('Epoch: ' + str(iter + 1) + '. ' + str(t) +
+                                            ' frames have beeen processed in total. ' +
+                                            str(self.N - old_comps) +
+                                            ' new components were added. Total # of components is '
+                                            + str(self.estimates.Ab.shape[-1] - self.params.get('init', 'nb')))
+                            old_comps = self.N
                         t += 1
                     except  (StopIteration, RuntimeError):
                         print(f'Error occors in frame {frame_count}')
