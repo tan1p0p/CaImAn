@@ -1233,12 +1233,6 @@ class OnACID(object):
         else:
             model_LN = None
 
-        # try to read all files        
-        # while len(fls) == 0:
-        #     logging.info('No .h5 files on dir. Read again.')
-        #     sleep(0.1)
-        #     fls = sorted(glob.glob(os.path.join(video_dir, '*.h5')))
-
         # If fls[0] is avalable, still first file unreadable.
         finish_init = False
         while finish_init == False:
@@ -1285,7 +1279,7 @@ class OnACID(object):
         while True:
             fls = glob.glob(os.path.join(video_dir, '*.h5'))
             fls = sorted(list(set(fls) - finished_files - skipped_files))
-            
+
             if len(fls) == 0:
                 logging.warning('There are no more files left! Now waiting for a next frame...')
                 continue
@@ -1318,6 +1312,7 @@ class OnACID(object):
                     frame = next(Y_)
                     t_online.append(self.fit_next_from_raw(frame, t, model_LN=model_LN))
                     t += 1
+                    self.set_results(epochs, t)
                 except OSError as e:
                     logging.info('This .h5 file cannot read yet.')
                     break
@@ -1326,42 +1321,12 @@ class OnACID(object):
                     if mode == 'real-time':
                         skipped_files |= set(fls[:-2])
                     finished_files.add(file_name)
-                    logging.info(self.estimates.C_on[self.params.get('init', 'nb'):self.M, t - t // epochs:t].shape)
                     break
             # =====================================
-            
+
             logging.warning(f'Average processing time: {(time() - start_time) / (t):.3f} sec')
 
-        if self.params.get('online', 'normalize'):
-            self.estimates.Ab = csc_matrix(self.estimates.Ab.multiply(
-                self.img_norm.reshape(-1, order='F')[:, np.newaxis]))
-        self.estimates.A, self.estimates.b = self.estimates.Ab[:, self.params.get('init', 'nb'):], self.estimates.Ab[:, :self.params.get('init', 'nb')].toarray()
-        self.estimates.C, self.estimates.f = self.estimates.C_on[self.params.get('init', 'nb'):self.M, t - t //
-                         epochs:t], self.estimates.C_on[:self.params.get('init', 'nb'), t - t // epochs:t]
-        noisyC = self.estimates.noisyC[self.params.get('init', 'nb'):self.M, t - t // epochs:t]
-        self.estimates.YrA = noisyC - self.estimates.C
-        if self.estimates.OASISinstances is not None:
-            self.estimates.bl = [osi.b for osi in self.estimates.OASISinstances]
-            self.estimates.S = np.stack([osi.s for osi in self.estimates.OASISinstances])
-            self.estimates.S = self.estimates.S[:, t - t // epochs:t]
-        else:
-            self.estimates.bl = [0] * self.estimates.C.shape[0]
-            self.estimates.S = np.zeros_like(self.estimates.C)
-        if self.params.get('online', 'ds_factor') > 1:
-            dims = frame.shape
-            self.estimates.A = hstack([coo_matrix(cv2.resize(self.estimates.A[:, i].reshape(self.estimates.dims, order='F').toarray(),
-                                                            dims[::-1]).reshape(-1, order='F')[:,None]) for i in range(self.N)], format='csc')
-            if self.estimates.b.shape[-1] > 0:
-                self.estimates.b = np.concatenate([cv2.resize(self.estimates.b[:, i].reshape(self.estimates.dims, order='F'),
-                                                              dims[::-1]).reshape(-1, order='F')[:,None] for i in range(self.params.get('init', 'nb'))], axis=1)
-            else:
-                self.estimates.b = np.resize(self.estimates.b, (self.estimates.A.shape[0], 0))
-            if self.estimates.b0 is not None:
-                b0 = self.estimates.b0.reshape(self.estimates.dims, order='F')
-                b0 = cv2.resize(b0, dims[::-1])
-                self.estimates.b0 = b0.reshape((-1, 1), order='F')
-            self.params.set('data', {'dims': dims})
-            self.estimates.dims = dims
+        self.restore_ds(frame.shape)
         if self.params.get('online', 'save_online_movie'):
             out.release()
         if self.params.get('online', 'show_movie'):
@@ -1477,7 +1442,7 @@ class OnACID(object):
                 process_files = fls[:init_files + extra_files]
                 init_batc_iter = [0] * (extra_files + init_files)
 
-        #     Go through all files
+            # Go through all files
             for file_count, ffll in enumerate(process_files):
                 logging.warning('Now processing file {}'.format(ffll))
                 Y_ = caiman.base.movies.load_iter(
@@ -1510,36 +1475,8 @@ class OnACID(object):
         
             self.Ab_epoch.append(self.estimates.Ab.copy())
 
-        if self.params.get('online', 'normalize'):
-            self.estimates.Ab = csc_matrix(self.estimates.Ab.multiply(
-                self.img_norm.reshape(-1, order='F')[:, np.newaxis]))
-        self.estimates.A, self.estimates.b = self.estimates.Ab[:, self.params.get('init', 'nb'):], self.estimates.Ab[:, :self.params.get('init', 'nb')].toarray()
-        self.estimates.C, self.estimates.f = self.estimates.C_on[self.params.get('init', 'nb'):self.M, t - t //
-                         epochs:t], self.estimates.C_on[:self.params.get('init', 'nb'), t - t // epochs:t]
-        noisyC = self.estimates.noisyC[self.params.get('init', 'nb'):self.M, t - t // epochs:t]
-        self.estimates.YrA = noisyC - self.estimates.C
-        if self.estimates.OASISinstances is not None:
-            self.estimates.bl = [osi.b for osi in self.estimates.OASISinstances]
-            self.estimates.S = np.stack([osi.s for osi in self.estimates.OASISinstances])
-            self.estimates.S = self.estimates.S[:, t - t // epochs:t]
-        else:
-            self.estimates.bl = [0] * self.estimates.C.shape[0]
-            self.estimates.S = np.zeros_like(self.estimates.C)
-        if self.params.get('online', 'ds_factor') > 1:
-            dims = frame.shape
-            self.estimates.A = hstack([coo_matrix(cv2.resize(self.estimates.A[:, i].reshape(self.estimates.dims, order='F').toarray(),
-                                                            dims[::-1]).reshape(-1, order='F')[:,None]) for i in range(self.N)], format='csc')
-            if self.estimates.b.shape[-1] > 0:
-                self.estimates.b = np.concatenate([cv2.resize(self.estimates.b[:, i].reshape(self.estimates.dims, order='F'),
-                                                              dims[::-1]).reshape(-1, order='F')[:,None] for i in range(self.params.get('init', 'nb'))], axis=1)
-            else:
-                self.estimates.b = np.resize(self.estimates.b, (self.estimates.A.shape[0], 0))
-            if self.estimates.b0 is not None:
-                b0 = self.estimates.b0.reshape(self.estimates.dims, order='F')
-                b0 = cv2.resize(b0, dims[::-1])
-                self.estimates.b0 = b0.reshape((-1, 1), order='F')
-            self.params.set('data', {'dims': dims})
-            self.estimates.dims = dims
+        self.set_results(epochs, t)
+        self.restore_dims(frame.shape)
         if self.params.get('online', 'save_online_movie'):
             out.release()
         if self.params.get('online', 'show_movie'):
@@ -1631,6 +1568,39 @@ class OnACID(object):
         if transpose:
             self.dims = self.dims[::-1]
         return vid_frame
+
+    def restore_ds(self, dims):
+        if self.params.get('online', 'ds_factor') > 1:
+            self.estimates.A = hstack([coo_matrix(cv2.resize(self.estimates.A[:, i].reshape(self.estimates.dims, order='F').toarray(),
+                                                            dims[::-1]).reshape(-1, order='F')[:,None]) for i in range(self.N)], format='csc')
+            if self.estimates.b.shape[-1] > 0:
+                self.estimates.b = np.concatenate([cv2.resize(self.estimates.b[:, i].reshape(self.estimates.dims, order='F'),
+                                                            dims[::-1]).reshape(-1, order='F')[:,None] for i in range(self.params.get('init', 'nb'))], axis=1)
+            else:
+                self.estimates.b = np.resize(self.estimates.b, (self.estimates.A.shape[0], 0))
+            if self.estimates.b0 is not None:
+                b0 = self.estimates.b0.reshape(self.estimates.dims, order='F')
+                b0 = cv2.resize(b0, dims[::-1])
+                self.estimates.b0 = b0.reshape((-1, 1), order='F')
+            self.params.set('data', {'dims': dims})
+            self.estimates.dims = dims
+
+    def set_results(self, epochs, t):
+        if self.params.get('online', 'normalize'):
+            self.estimates.Ab = csc_matrix(self.estimates.Ab.multiply(
+                self.img_norm.reshape(-1, order='F')[:, np.newaxis]))
+        self.estimates.A, self.estimates.b = self.estimates.Ab[:, self.params.get('init', 'nb'):], self.estimates.Ab[:, :self.params.get('init', 'nb')].toarray()
+        self.estimates.C, self.estimates.f = self.estimates.C_on[self.params.get('init', 'nb'):self.M, t - t //
+                         epochs:t], self.estimates.C_on[:self.params.get('init', 'nb'), t - t // epochs:t]
+        noisyC = self.estimates.noisyC[self.params.get('init', 'nb'):self.M, t - t // epochs:t]
+        self.estimates.YrA = noisyC - self.estimates.C
+        if self.estimates.OASISinstances is not None:
+            self.estimates.bl = [osi.b for osi in self.estimates.OASISinstances]
+            self.estimates.S = np.stack([osi.s for osi in self.estimates.OASISinstances])
+            self.estimates.S = self.estimates.S[:, t - t // epochs:t]
+        else:
+            self.estimates.bl = [0] * self.estimates.C.shape[0]
+            self.estimates.S = np.zeros_like(self.estimates.C)
 
 
 #%%
