@@ -1226,7 +1226,7 @@ class OnACID(object):
             fls = sorted(list(set(fls) - finished_files - skipped_files))
 
             if len(fls) == 0:
-                logging.warning('There are no more files left! Now waiting for a next frame...')
+                # logging.warning('There are no more files left! Now waiting for a next frame...')
                 continue
             else:
                 # 最初の1回だけファイル全体を使う。'real-time'モードではそれ以降最新のファイルだけ使う。
@@ -1243,32 +1243,26 @@ class OnACID(object):
                     raise ValueError
 
             old_comps = self.N # number of existing components
-            Y_ = caiman.base.movies.load_iter(
+
+            # fit every frame in .h5 file
+            logging.warning(f'Now processing file {file_name} from frame: {start_frame}')
+            Y_ = caiman.base.movies.load(
                 file_name,
                 var_name_hdf5=self.params.get('data', 'var_name_hdf5'),
                 subindices=slice(start_frame, None, None))
+            if len(Y_.shape) == 2:
+                Y_ = Y_[np.newaxis]
 
-            # =====================================
-            # main fit loop in each .h5 file
-            # =====================================
-            while True: # process each file
-                logging.warning('Now processing file {}'.format(file_name))
-                try:
-                    frame = next(Y_)
-                    t_online.append(self.fit_next_from_raw(frame, t, model_LN=model_LN))
-                    t += 1
-                    self.set_results(epochs, t)
-                except OSError as e:
-                    logging.info('This .h5 file cannot read yet.')
-                    break
-                except (StopIteration, RuntimeError):
-                    logging.info('This .h5 file analysis is finished.')
-                    if mode == 'real-time':
-                        skipped_files |= set(fls[:-2])
-                    finished_files.add(file_name)
-                    break
-            # =====================================
+            for i, frame in enumerate(Y_):
+                logging.info(f'{frame.shape}, {t}')
+                t_online.append(self.fit_next_from_raw(frame, t, model_LN=model_LN))
+                t += 1
 
+            self.set_results(epochs, t)
+            if mode == 'real-time':
+                skipped_files |= set(fls[:-2])
+            finished_files.add(file_name)
+            file_count += 1
             logging.warning(f'Average processing time: {(time() - start_time) / (t):.3f} sec')
 
         self.restore_ds(frame.shape)
@@ -1367,6 +1361,11 @@ class OnACID(object):
                 while True: # process each file
                     try:
                         frame = next(Y_)
+                        print(frame)
+                        print(frame.shape)
+                        import matplotlib.pyplot as plt
+                        plt.imsave('online.png', frame)
+                        exit()
                         frame_count += 1
                         t_online.append(self.fit_next_from_raw(frame, t, model_LN=model_LN))
                         if t % 500 == 0:
@@ -1385,7 +1384,7 @@ class OnACID(object):
             self.Ab_epoch.append(self.estimates.Ab.copy())
 
         self.set_results(epochs, t)
-        self.restore_dims(frame.shape)
+        self.restore_ds(frame.shape)
         if self.params.get('online', 'save_online_movie'):
             out.release()
         if self.params.get('online', 'show_movie'):
