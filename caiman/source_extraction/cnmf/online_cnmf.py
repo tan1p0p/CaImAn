@@ -933,14 +933,18 @@ class OnACID(object):
 
         return self
 
-    def initialize_online(self, model_LN=None, fls=None, init_batch=None):
+    def initialize_online(self, model_LN=None, fls=None, init_batch=None, Y=None):
         if fls == None:
             fls = self.params.get('data', 'fnames')
         opts = self.params.get_group('online')
         if init_batch == None:
             init_batch = opts['init_batch']
-        Y = caiman.load(fls[0], subindices=slice(0, init_batch,
-                    None), var_name_hdf5=self.params.get('data', 'var_name_hdf5')).astype(np.float32)
+        if type(Y) != caiman.base.movies.movie:
+            mode = 'from_file'
+            Y = caiman.load(fls[0], subindices=slice(0, init_batch,
+                        None), var_name_hdf5=self.params.get('data', 'var_name_hdf5')).astype(np.float32)
+        else:
+            mode = 'from_scope'
         if model_LN is not None:
             Y = Y - caiman.movie(np.squeeze(model_LN.predict(np.expand_dims(Y, -1))))
             Y = np.maximum(Y, 0)
@@ -1050,10 +1054,13 @@ class OnACID(object):
             self.estimates.lam = np.zeros(nr)
         else:
             raise Exception('Unknown initialization method!')
-        dims, Ts = get_file_size(fls, var_name_hdf5=self.params.get('data', 'var_name_hdf5'))
+        if mode == 'from_scope':
+            T1 = init_batch*self.params.get('online', 'epochs')
+        else:
+            _, Ts = get_file_size(fls, var_name_hdf5=self.params.get('data', 'var_name_hdf5'))
+            T1 = np.array(Ts).sum()*self.params.get('online', 'epochs')
         dims = Y.shape[1:]
         self.params.set('data', {'dims': dims})
-        T1 = np.array(Ts).sum()*self.params.get('online', 'epochs')
         logging.info('before prepare')
         self._prepare_object(Yr, T1)
         logging.info('after prepare')
@@ -1170,6 +1177,147 @@ class OnACID(object):
                 # break
                 pass
         return time() - t_frame_start
+
+    def fit_from_scope(self, video_dir, **kargs):
+        # mode: 'frame-to-frame' or 'real-time'
+        init_batch = self.params.get('online', 'init_batch')
+        epochs = self.params.get('online', 'epochs')
+
+        # set some camera params
+        cap = cv2.VideoCapture('/Users/masan/Codes/online-calcium-imaging/data/interim/20191017_130713/20191017_130713.avi')
+        # cap = cv2.VideoCapture(0)
+        window_name = 'prev'
+
+        # TODO: Need to fix here later
+        model_LN = self.get_model_LN()
+
+        # create switch for choose GAIN
+        def set_GAIN(x):
+            gain = [16, 32, 64]
+            print(cap.set(14, gain[x]))
+            sleep(0.01)
+            print(f'gain: {cap.get(14)}')
+        gain_text = 'gain'
+
+        # create switch for choose FPS
+        def set_FPS(x):
+            fps = [10, 30, 60]
+            print(cap.set(5, fps[x]))
+            sleep(0.01)
+            print(f'fps: {cap.get(5)}')
+        fps_text = '0: 10fps\n1: 30fps\n2: 60fps'
+        x0_text, x1_text = 'set_x0', 'set_x1'
+        y0_text, y1_text = 'set_y0', 'set_y2'
+        dr_max_text = 'dynamic range: max'
+        dr_min_text = 'dynamic range: min'
+
+        ret, frame = cap.read()
+        h, w, _ = frame.shape
+        print(h,w)
+        def prepare_window(delete_prev=False):
+            if delete_prev:
+                cv2.destroyWindow(window_name)
+            cv2.namedWindow(window_name)
+            cv2.createTrackbar(gain_text, window_name, 0, 2, set_GAIN)
+            cv2.createTrackbar(fps_text, window_name, 0, 2, set_FPS)
+            cv2.createTrackbar(dr_max_text, window_name, 255, 255, lambda x:x)
+            cv2.createTrackbar(dr_min_text, window_name, 0, 255, lambda x:x)
+
+            cv2.createTrackbar(x0_text, window_name, 0, w, lambda x:x)
+            cv2.createTrackbar(x1_text, window_name, w, w, lambda x:x)
+            cv2.createTrackbar(y0_text, window_name, 0, h, lambda x:x)
+            cv2.createTrackbar(y1_text, window_name, h, h, lambda x:x)
+
+        def show_next_frame(text='sample', text_color=(255, 255, 255)):
+            ret, frame = cap.read()
+            h, w, _ = frame.shape
+            x0 = cv2.getTrackbarPos(x0_text, window_name)
+            x1 = cv2.getTrackbarPos(x1_text, window_name)
+            y0 = cv2.getTrackbarPos(y0_text, window_name)
+            y1 = cv2.getTrackbarPos(y1_text, window_name)
+            frame = frame[y0:y1, x0:x1]
+
+            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            cv2.putText(frame, text, (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color)
+            dr_max = cv2.getTrackbarPos(dr_max_text, window_name)
+            dr_min = cv2.getTrackbarPos(dr_min_text, window_name)
+
+            frame = frame.astype('float')
+            frame[frame > dr_max] = dr_max
+            frame[frame < dr_min] = dr_min
+            frame -= dr_min
+            frame *= (255 / frame.max())
+            frame = frame.astype('uint8')
+
+            cv2.imshow(window_name, frame)
+            cv2.getTrackbarPos(gain_text, window_name)
+            cv2.getTrackbarPos(fps_text, window_name)
+            return gray_frame
+
+        prepare_window()
+        # finish prepare phase when set to 1
+        start_text = 'start analysis!'
+        cv2.createTrackbar(start_text, window_name, 0, 1, lambda x: True if x == 0 else False)
+        logging.info('now preparing')
+        while True:
+            frame = show_next_frame(text='prepareing', text_color=(255, 255, 255))
+            if cv2.waitKey(1) & 0xFF == ord('q') or cv2.getTrackbarPos(start_text, window_name):
+                break
+        
+        logging.info('now recording for init')
+        prepare_window(delete_prev=True)
+        init_Y = np.empty((init_batch,) + frame.shape)
+        for i in range(init_batch):
+            frame = show_next_frame(text='initialize', text_color=(0, 0, 255))
+            init_Y[i] = frame.copy()
+            cv2.waitKey(1)
+
+        logging.info('now initializing...')
+        Y_init = caiman.base.movies.movie(init_Y.astype(np.float32))
+        self.initialize_online(model_LN=model_LN, Y=Y_init)
+
+        self.Ab_epoch:List = []
+        self.comp_upd = []
+        self.t_shapes:List = []
+        self.t_detect:List = []
+        self.t_motion:List = []
+        self.t_stat:List = []
+
+        t = init_batch
+        logging.info('now running CNMF-E')
+        prepare_window(delete_prev=True)
+        t_online = []
+        FPS = 0
+        while True:
+            t0 = time()
+            if t % 100 == 0:
+                self.estimates.noisyC = np.hstack(
+                    (self.estimates.noisyC, np.zeros((self.estimates.noisyC.shape[0], 100))))
+                self.estimates.C_on = np.hstack(
+                    (self.estimates.C_on, np.zeros((self.estimates.C_on.shape[0], 100))))
+
+            frame = show_next_frame(text=f'analyzing\nFPS: {FPS}', text_color=(0, 0, 255))
+            t_online.append(self.fit_next_from_raw(frame, t, model_LN=model_LN))
+            t += 1
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+            FPS = 1 / (time() - t0)
+        
+        if self.params.get('online', 'save_online_movie') + self.params.get('online', 'show_movie'):
+            resize_fact = 2
+            fourcc = cv2.VideoWriter_fourcc(*self.params.get('online', 'opencv_codec'))
+            out = cv2.VideoWriter(self.params.get('online', 'movie_name_online'),
+                                  fourcc, 30, tuple([int(resize_fact*2*x) for x in self.params.get('data', 'dims')]),
+                                  True)
+
+        self.restore_ds(frame.shape)
+        if self.params.get('online', 'save_online_movie'):
+            out.release()
+        cv2.destroyAllWindows()
+        self.t_online = t_online
+        self.estimates.C_on = self.estimates.C_on[:self.M]
+        self.estimates.noisyC = self.estimates.noisyC[:self.M]
+        return self
 
     def fit_from_dir(self, video_dir, mode='frame-by-frame', **kargs):
         # mode: 'frame-to-frame' or 'real-time'
@@ -1479,7 +1627,8 @@ class OnACID(object):
 
     def restore_ds(self, dims):
         if self.params.get('online', 'ds_factor') > 1:
-            self.estimates.A = hstack([coo_matrix(cv2.resize(self.estimates.A[:, i].reshape(self.estimates.dims, order='F').toarray(),
+            print(self.N, self.estimates.A.shape)
+            self.estimates.A = hstack([coo_matrix(cv2.resize(self.estimates.A[:, i].reshape(self.estimates.dims, order='F'),
                                                             dims[::-1]).reshape(-1, order='F')[:,None]) for i in range(self.N)], format='csc')
             if self.estimates.b.shape[-1] > 0:
                 self.estimates.b = np.concatenate([cv2.resize(self.estimates.b[:, i].reshape(self.estimates.dims, order='F'),
