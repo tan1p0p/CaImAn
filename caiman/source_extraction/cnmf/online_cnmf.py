@@ -19,9 +19,12 @@ from builtins import range
 from builtins import str
 from builtins import zip
 import cv2
+import h5py
 import glob
 import logging
 from math import sqrt
+import matplotlib
+import matplotlib.pyplot as plt
 from multiprocessing import current_process, cpu_count
 import numpy as np
 import os
@@ -32,6 +35,7 @@ from scipy.sparse import coo_matrix, csc_matrix, spdiags, hstack
 from scipy.stats import norm
 from sklearn.decomposition import NMF
 from sklearn.preprocessing import normalize
+import sys
 import tensorflow as tf
 from time import time, sleep
 from typing import List, Tuple
@@ -52,6 +56,8 @@ from ...motion_correction import (motion_correct_iteration_fast,
 from ...utils.utils import save_dict_to_hdf5, load_dict_from_hdf5, parmap, load_graph
 from ...utils.stats import pd_solve
 from ... import summary_images
+
+matplotlib.use('Agg')
 
 try:
     cv2.setNumThreads(0)
@@ -1039,7 +1045,6 @@ class OnACID(object):
                     self.estimates.A /= self.img_norm.reshape(-1, order='F')[:, np.newaxis]
                     self.estimates.b /= self.img_norm.reshape(-1, order='F')[:, np.newaxis]
                     self.estimates.A = csc_matrix(self.estimates.A)
-
         elif self.params.get('online', 'init_method') == 'seeded':
             self.estimates.A, self.estimates.b, self.estimates.C, self.estimates.f, self.estimates.YrA = seeded_initialization(
                     Y.transpose(1, 2, 0), self.estimates.A, gnb=self.params.get('init', 'nb'), k=self.params.get('init', 'K'),
@@ -1178,14 +1183,14 @@ class OnACID(object):
                 pass
         return time() - t_frame_start
 
-    def fit_from_scope(self, video_dir, **kargs):
+    def fit_from_scope(self, out_file_name, **kargs):
         # mode: 'frame-to-frame' or 'real-time'
         init_batch = self.params.get('online', 'init_batch')
         epochs = self.params.get('online', 'epochs')
 
         # set some camera params
+        cap = cv2.VideoCapture(0)
         cap = cv2.VideoCapture('/Users/masan/Codes/online-calcium-imaging/data/interim/20191017_130713/20191017_130713.avi')
-        # cap = cv2.VideoCapture(0)
         window_name = 'prev'
 
         # TODO: Need to fix here later
@@ -1211,66 +1216,84 @@ class OnACID(object):
         dr_max_text = 'dynamic range: max'
         dr_min_text = 'dynamic range: min'
 
-        ret, frame = cap.read()
+        _, frame = cap.read()
         h, w, _ = frame.shape
-        print(h,w)
-        def prepare_window(delete_prev=False):
-            if delete_prev:
-                cv2.destroyWindow(window_name)
+        win_params = {}
+        max_bright = max(255, frame.max())
+
+        def prepare_window(win_params, is_prepare_mode=False):
+            cv2.destroyAllWindows()
             cv2.namedWindow(window_name)
             cv2.createTrackbar(gain_text, window_name, 0, 2, set_GAIN)
-            cv2.createTrackbar(fps_text, window_name, 0, 2, set_FPS)
-            cv2.createTrackbar(dr_max_text, window_name, 255, 255, lambda x:x)
-            cv2.createTrackbar(dr_min_text, window_name, 0, 255, lambda x:x)
+            if is_prepare_mode:
+                cv2.createTrackbar(fps_text, window_name, 0, 2, set_FPS)
+                cv2.createTrackbar(x0_text, window_name, 0, w, lambda x:x)
+                cv2.createTrackbar(x1_text, window_name, w, w, lambda x:x)
+                cv2.createTrackbar(y0_text, window_name, 0, h, lambda x:x)
+                cv2.createTrackbar(y1_text, window_name, h, h, lambda x:x)
+            cv2.createTrackbar(dr_min_text, window_name, 0, max_bright, lambda x:x)
+            cv2.createTrackbar(dr_max_text, window_name, max_bright, max_bright, lambda x:x)
 
-            cv2.createTrackbar(x0_text, window_name, 0, w, lambda x:x)
-            cv2.createTrackbar(x1_text, window_name, w, w, lambda x:x)
-            cv2.createTrackbar(y0_text, window_name, 0, h, lambda x:x)
-            cv2.createTrackbar(y1_text, window_name, h, h, lambda x:x)
+        def show_next_frame(text, win_params, mode, text_color=(255, 255, 255), avi_out=None):
+            _, frame = cap.read()
+            if mode == 'prepare':
+                win_params['x0'] = cv2.getTrackbarPos(x0_text, window_name)
+                win_params['x1'] = cv2.getTrackbarPos(x1_text, window_name)
+                win_params['y0'] = cv2.getTrackbarPos(y0_text, window_name)
+                win_params['y1'] = cv2.getTrackbarPos(y1_text, window_name)
+                cv2.getTrackbarPos(fps_text, window_name)
+            cv2.getTrackbarPos(gain_text, window_name)
 
-        def show_next_frame(text='sample', text_color=(255, 255, 255)):
-            ret, frame = cap.read()
-            h, w, _ = frame.shape
-            x0 = cv2.getTrackbarPos(x0_text, window_name)
-            x1 = cv2.getTrackbarPos(x1_text, window_name)
-            y0 = cv2.getTrackbarPos(y0_text, window_name)
-            y1 = cv2.getTrackbarPos(y1_text, window_name)
-            frame = frame[y0:y1, x0:x1]
+            frame = frame[win_params['y0']:win_params['y1'], win_params['x0']:win_params['x1']]
+            if avi_out != None:
+                avi_out.write(frame)
+            out_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            cv2.putText(frame, text, (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color)
-            dr_max = cv2.getTrackbarPos(dr_max_text, window_name)
-            dr_min = cv2.getTrackbarPos(dr_min_text, window_name)
-
+            win_params['dr_min'] = cv2.getTrackbarPos(dr_min_text, window_name)
+            win_params['dr_max'] = cv2.getTrackbarPos(dr_max_text, window_name)
             frame = frame.astype('float')
-            frame[frame > dr_max] = dr_max
-            frame[frame < dr_min] = dr_min
-            frame -= dr_min
-            frame *= (255 / frame.max())
+            frame[frame < win_params['dr_min']] = win_params['dr_min']
+            frame[frame > win_params['dr_max']] = win_params['dr_max']
+            frame -= win_params['dr_min']
+            frame *= 255 / (win_params['dr_max'] - win_params['dr_min'])
             frame = frame.astype('uint8')
 
-            cv2.imshow(window_name, frame)
-            cv2.getTrackbarPos(gain_text, window_name)
-            cv2.getTrackbarPos(fps_text, window_name)
-            return gray_frame
+            if mode == 'analize':
+                frame = np.hstack([frame, self.A_plot, self.C_plot])
 
-        prepare_window()
-        # finish prepare phase when set to 1
+            cv2.putText(frame, text, (5, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color)
+            cv2.imshow(window_name, frame)
+            return out_frame, win_params
+
+        prepare_window(win_params, is_prepare_mode=True)
         start_text = 'start analysis!'
-        cv2.createTrackbar(start_text, window_name, 0, 1, lambda x: True if x == 0 else False)
+        cv2.createTrackbar(start_text, window_name, 0, 1, lambda x: True if x == 0 else False) # finish prepare phase when set to 1
+
         logging.info('now preparing')
         while True:
-            frame = show_next_frame(text='prepareing', text_color=(255, 255, 255))
+            frame, win_params = show_next_frame('prepareing...', win_params, mode='prepare')
             if cv2.waitKey(1) & 0xFF == ord('q') or cv2.getTrackbarPos(start_text, window_name):
                 break
-        
+
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        avi_out = cv2.VideoWriter(
+            out_file_name + '.avi', fourcc, 10.0,
+            (win_params['x1'] - win_params['x0'], win_params['y1'] - win_params['y0']))
+
         logging.info('now recording for init')
-        prepare_window(delete_prev=True)
+        prepare_window(win_params)
         init_Y = np.empty((init_batch,) + frame.shape)
+
+        with h5py.File(out_file_name + '.mat', 'w') as f:
+            f['initialize_first_frame_t'] = time()
+
         for i in range(init_batch):
-            frame = show_next_frame(text='initialize', text_color=(0, 0, 255))
+            frame, _ = show_next_frame('initialize', win_params, mode='initialize', text_color=(0, 0, 255), avi_out=avi_out)
             init_Y[i] = frame.copy()
             cv2.waitKey(1)
+
+        with h5py.File(out_file_name + '.mat', 'a') as f:
+            f['initialize_last_frame_t'] = time()
 
         logging.info('now initializing...')
         Y_init = caiman.base.movies.movie(init_Y.astype(np.float32))
@@ -1285,38 +1308,94 @@ class OnACID(object):
 
         t = init_batch
         logging.info('now running CNMF-E')
-        prepare_window(delete_prev=True)
+        prepare_window(win_params)
         t_online = []
         FPS = 0
+
+        fig = plt.figure(figsize=(6, h/100))
+        ax = fig.add_subplot(111)
+        plot_indeces = [0, 1, 2, 3, 4, 5]
+        colors = [(1,0,0), (0,1,0), (0,0,1), (1,1,0), (1,0,1), (0,1,1)]
+        plt.gca().spines['top'].set_visible(False)
+        plt.gca().spines['right'].set_visible(False)
+        plt.gca().spines['left'].set_visible(False)
+        plt.subplots_adjust(left=0, right=1, top=1)
+
+        def set_plot():
+            ax.clear()
+            A_plot = np.zeros((h, w, 3))
+            for i, idx in enumerate(plot_indeces):
+                a_i = self.estimates.A[:, idx].reshape((self.estimates.dims[1], self.estimates.dims[0])).T
+                a_i = cv2.resize(a_i.toarray(), (w, h))
+                a_i = a_i / a_i.max() * 255
+                A_plot[:, :, 0] += a_i * colors[i][0]
+                A_plot[:, :, 1] += a_i * colors[i][1]
+                A_plot[:, :, 2] += a_i * colors[i][2]
+            A_plot[A_plot > 255] = 255
+            self.A_plot = A_plot.astype('uint8')
+
+            for i, idx in enumerate(plot_indeces):
+                c_i = self.estimates.C[idx]
+                end_frame = len(c_i)
+                start_frame = end_frame - min(c_i.shape[0], 500)
+                c_i = c_i[start_frame:]
+                c_i = (c_i - max(c_i.min(), 0)) / max(1., c_i.max()) + 1.2 * i # normalize to 0..1 and add padding
+                ax.plot(c_i, color=colors[i])
+            ax.set_xticks(list(range(0, len(c_i), 100)) + [len(c_i)])
+            ax.set_xticklabels(list(range(start_frame, end_frame, 100)) + [len(c_i)])
+            ax.tick_params(left=False)
+            fig.canvas.draw()
+            C_plot = np.fromstring(fig.canvas.tostring_rgb(), dtype=np.uint8, sep='')
+            C_plot = C_plot.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+            self.C_plot = C_plot
+
+        with h5py.File(out_file_name + '.mat', 'a') as f:
+            f['cnmfe_first_frame_t'] = time()
+            A_size = frame.shape[0] * frame.shape[1]
+            f.create_dataset('A', (A_size, self.N), maxshape=(A_size, None))
+            f.create_dataset('C', (self.N, 100), maxshape=(None, None))
+            f.create_dataset('S', (self.N, 100), maxshape=(None, None))
+
         while True:
-            t0 = time()
-            if t % 100 == 0:
-                self.estimates.noisyC = np.hstack(
-                    (self.estimates.noisyC, np.zeros((self.estimates.noisyC.shape[0], 100))))
-                self.estimates.C_on = np.hstack(
-                    (self.estimates.C_on, np.zeros((self.estimates.C_on.shape[0], 100))))
+            try:
+                t0 = time()
 
-            frame = show_next_frame(text=f'analyzing\nFPS: {FPS}', text_color=(0, 0, 255))
-            t_online.append(self.fit_next_from_raw(frame, t, model_LN=model_LN))
-            t += 1
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-            FPS = 1 / (time() - t0)
+                if t % 100 == 0:
+                    self.set_results(1, t)
+                    set_plot()
+                    self.estimates.noisyC = np.hstack(
+                        (self.estimates.noisyC, np.zeros((self.estimates.noisyC.shape[0], 100))))
+                    self.estimates.C_on = np.hstack(
+                        (self.estimates.C_on, np.zeros((self.estimates.C_on.shape[0], 100))))
+                elif t % 100 == 10:
+                    if self.params.get('online', 'ds_factor') > 1:
+                        A = np.hstack([cv2.resize(self.estimates.A[:, i].reshape(self.estimates.dims, order='F').toarray(),
+                                                frame.shape[::-1]).reshape(-1, order='F')[:,None] for i in range(self.N)])
+                elif t % 100 == 20:
+                    with h5py.File(out_file_name + '.mat', 'a') as f:
+                        f['A'].resize(A.shape)
+                        f['A'][()] = A
+                elif t % 100 == 30:
+                    with h5py.File(out_file_name + '.mat', 'a') as f:
+                        f['C'].resize(self.estimates.C.shape)
+                        f['C'][()] = self.estimates.C
+                elif t % 100 == 40:
+                    with h5py.File(out_file_name + '.mat', 'a') as f:
+                        f['S'].resize(self.estimates.S.shape)
+                        f['S'][()] = self.estimates.S
+
+                frame, _ = show_next_frame(f'FPS: {FPS}', win_params, mode='analize', text_color=(0, 0, 255), avi_out=avi_out)
+                t_online.append(self.fit_next_from_raw(frame, t, model_LN=model_LN))
+                t += 1
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+                FPS = 1 / (time() - t0)
+            except:
+                print(sys.sys.exc_info())
         
-        if self.params.get('online', 'save_online_movie') + self.params.get('online', 'show_movie'):
-            resize_fact = 2
-            fourcc = cv2.VideoWriter_fourcc(*self.params.get('online', 'opencv_codec'))
-            out = cv2.VideoWriter(self.params.get('online', 'movie_name_online'),
-                                  fourcc, 30, tuple([int(resize_fact*2*x) for x in self.params.get('data', 'dims')]),
-                                  True)
-
-        self.restore_ds(frame.shape)
-        if self.params.get('online', 'save_online_movie'):
-            out.release()
-        cv2.destroyAllWindows()
-        self.t_online = t_online
-        self.estimates.C_on = self.estimates.C_on[:self.M]
-        self.estimates.noisyC = self.estimates.noisyC[:self.M]
+        with h5py.File(out_file_name + '.mat', 'a') as f:
+            f['cnmfe_last_frame_t'] = time()
+        avi_out.release()
         return self
 
     def fit_from_dir(self, video_dir, mode='frame-by-frame', **kargs):
@@ -1627,8 +1706,7 @@ class OnACID(object):
 
     def restore_ds(self, dims):
         if self.params.get('online', 'ds_factor') > 1:
-            print(self.N, self.estimates.A.shape)
-            self.estimates.A = hstack([coo_matrix(cv2.resize(self.estimates.A[:, i].reshape(self.estimates.dims, order='F'),
+            self.estimates.A = hstack([coo_matrix(cv2.resize(self.estimates.A[:, i].reshape(self.estimates.dims, order='F').toarray(),
                                                             dims[::-1]).reshape(-1, order='F')[:,None]) for i in range(self.N)], format='csc')
             if self.estimates.b.shape[-1] > 0:
                 self.estimates.b = np.concatenate([cv2.resize(self.estimates.b[:, i].reshape(self.estimates.dims, order='F'),
